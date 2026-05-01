@@ -5,3 +5,4 @@ Prerequisites: Node.js
 2.Run the app: go to dist folder and execute index.htlm with ur browser and done
 but first download the repository
 or go to realeses for an done index.html
+sorry an bug has been occurided so go to Win11 simu fix and do these steps on win11 simu fix
