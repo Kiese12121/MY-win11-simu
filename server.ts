@@ -11,22 +11,49 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  // Real DistroSea Proxy with aggressive header and content rewriting
-  const isoProxy = createProxyMiddleware({
-    target: 'https://cdimage.debian.org',
-    changeOrigin: true,
-    followRedirects: true,
-    pathRewrite: {
-      '^/iso-proxy': '',
-    },
-    on: {
-      proxyRes: (proxyRes, req, res) => {
-        res.setHeader('Access-Control-Allow-Origin', '*');
+  // Real ISO Proxy with aggressive redirect following and streaming
+  app.use('/iso-proxy', async (req, res) => {
+    try {
+      const urlPath = req.url.replace(/^\//, '');
+      const targetUrl = `https://cdimage.debian.org/${urlPath}`;
+      console.log('Proxying ISO Request:', targetUrl, req.headers.range);
+      
+      const fetch = (await import('node-fetch')).default;
+      const response = await fetch(targetUrl, {
+        method: req.method,
+        redirect: 'follow',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+          ...(req.headers.range ? { 'Range': req.headers.range } : {})
+        }
+      });
+      
+      if (!response.ok && response.status !== 206) {
+        res.status(response.status).send('Upstream status ' + response.status);
+        return;
       }
+      
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Headers', 'Range');
+      res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges');
+      
+      res.status(response.status);
+      
+      for (const [key, value] of response.headers.entries()) {
+        res.setHeader(key, value);
+      }
+      
+      if (response.body) {
+         response.body.pipe(res);
+      } else {
+         res.end();
+      }
+      
+    } catch (err) {
+      console.error('ISO Proxy Error:', err);
+      res.status(500).send('Proxy Error');
     }
   });
-
-  app.use('/iso-proxy', isoProxy);
 
   const distroProxy = createProxyMiddleware({
     target: 'https://distrosea.com',
@@ -129,7 +156,7 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
+    app.get('*all', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }

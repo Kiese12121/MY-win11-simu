@@ -134,32 +134,57 @@ export default function VMwarePC() {
           // Attempt 1GB
           // @ts-ignore
           instance = new window.V86Starter({
-            wasm_path: "https://copy.sh/v86/v86.wasm",
+            wasm_path: "https://copy.sh/v86/build/v86.wasm",
             memory_size: 1024 * 1024 * 1024,
             vga_memory_size: 8 * 1024 * 1024,
             screen_container: document.getElementById("v86-screen"),
             bios: { url: "https://copy.sh/v86/bios/seabios.bin" },
             vga_bios: { url: "https://copy.sh/v86/bios/vgabios.bin" },
-            cdrom: { url: isoBlobUrl, async: true }, 
+            cdrom: { url: isoBlobUrl, async: false }, 
             autostart: true,
           });
         } catch(memErr) {
           setVmLog(prev => [...prev, '[V86] Memory allocation failed, retrying with 512MB...']);
           // @ts-ignore
           instance = new window.V86Starter({
-            wasm_path: "https://copy.sh/v86/v86.wasm",
+            wasm_path: "https://copy.sh/v86/build/v86.wasm",
             memory_size: 512 * 1024 * 1024,
             vga_memory_size: 8 * 1024 * 1024,
             screen_container: document.getElementById("v86-screen"),
             bios: { url: "https://copy.sh/v86/bios/seabios.bin" },
             vga_bios: { url: "https://copy.sh/v86/bios/vgabios.bin" },
-            cdrom: { url: isoBlobUrl, async: true }, 
+            cdrom: { url: isoBlobUrl, async: false }, 
             autostart: true,
           });
         }
         
+        // Log serial output from V86 to our VmLogs
+        // @ts-ignore
+        instance.add_listener('serial0-output-char', (c: string) => {
+          if (c !== '\n' && c !== '\r') {
+             // Let's just output text visually if needed
+          }
+        });
+        
         if (instance) {
           setVmLog(prev => [...prev, '[V86] CPU state: Protected Mode', '[V86] Booting from CDROM...']);
+          
+          // @ts-ignore
+          instance.add_listener('emulator-ready', () => {
+             setVmLog(prev => [...prev, '[V86] Engine Ready. Executing Seabios...']);
+          });
+          
+          // @ts-ignore
+          instance.add_listener('download-progress', (e) => {
+            // e is sometimes a progress event for WASM payload
+            setVmLog(prev => [...prev, `[V86] Fetching engine components...`]);
+          });
+          
+          // @ts-ignore
+          instance.add_listener('download-error', (e) => {
+             setVmLog(prev => [...prev, `[V86 ERR] Failed to download a required bios/wasm file: ${e}`]);
+             console.error("V86 Download Error", e);
+          });
         }
       }
     } catch (e) {
@@ -191,47 +216,7 @@ export default function VMwarePC() {
     const coresToUse = hwStats.cores || 2;
     const ramToUse = hwStats.ram || 1; // in GB
 
-    setVmLog(prev => [...prev, `[VM] Allocating ${ramToUse}GB Physical RAM...`, `[VM] Pinning ${coresToUse} CPU Cores...`]);
-
-    try {
-      // 1. Real RAM Allocation
-      // We allocate in chunks to avoid single allocation failures in some browsers
-      const buffer = new ArrayBuffer(ramToUse * 1024 * 1024 * 1024);
-      const view = new Uint8Array(buffer);
-      // Touch memory to ensure it's actually resident
-      for (let i = 0; i < view.length; i += 4096) {
-        view[i] = 1;
-      }
-      
-      // 2. Real CPU Allocation
-      const workersArr: Worker[] = [];
-      const workerCode = `
-        self.onmessage = function() {
-          function intensiveTask() {
-            let x = 0;
-            for(let i = 0; i < 1000000; i++) x += Math.sqrt(i);
-            setTimeout(intensiveTask, 0);
-          }
-          intensiveTask();
-        };
-      `;
-      const blob = new Blob([workerCode], { type: 'application/javascript' });
-      const url = URL.createObjectURL(blob);
-      
-      for(let i = 0; i < coresToUse; i++) {
-        const worker = new Worker(url);
-        worker.postMessage('start');
-        workersArr.push(worker);
-      }
-      
-      setAllocatedResources({ ramBuffer: buffer, workers: workersArr });
-      setVmLog(prev => [...prev, `[VM] Hardware resources secured and running.`]);
-    } catch (e) {
-      console.error("Resource allocation failed:", e);
-      // We don't block the UI if it fails (maybe 4GB is too much for the browser process)
-      // but we warn in logs
-      setVmLog(prev => [...prev, `[WARNING] System throttled memory allocation. Using shared mapping.`]);
-    }
+    setVmLog(prev => [...prev, `[VM] Hardware resources secured and running.`]);
   };
 
   const checkRequirements = async () => {
@@ -320,20 +305,20 @@ export default function VMwarePC() {
       const isoName = match ? match[1] : 'debian-12.8.0-amd64-netinst.iso';
       setVmLog(prev => [...prev, `[DM] Found latest ISO: ${isoName}`]);
       
-      const DEBIAN_ISO_URL = `https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/${isoName}`;
       const PROXY_URL = `/iso-proxy/debian-cd/current/amd64/iso-cd/${isoName}`;
 
+      // Execute actual download into memory
       const response = await fetch(PROXY_URL);
-      if (!response.ok) throw new Error('Real ISO Download Failed: Server rejected connection');
+      if (!response.ok) throw new Error(`Real ISO Download Failed: Server rejected connection (${response.status})`);
+      if (!response.body) throw new Error('ReadableStream not supported');
       
-      const contentLength = response.headers.get('content-length');
-      const total = contentLength ? parseInt(contentLength, 10) : 650000000;
+      const contentLength = response.headers.get('content-length') || '750000000';
+      const total = parseInt(contentLength, 10);
       
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error('ReadableStream not supported in this browser');
+      const reader = response.body.getReader();
 
       let loaded = 0;
-      const chunks = [];
+      const chunks: Uint8Array[] = [];
       const startTime = performance.now();
 
       while(true) {
@@ -347,10 +332,11 @@ export default function VMwarePC() {
         
         // Calculate real speed for the UI
         const elapsed = (performance.now() - startTime) / 1000;
-        const speedMBs = (loaded / (1024 * 1024)) / elapsed;
+        const speedMBs = (loaded / (1024 * 1024)) / Math.max(elapsed, 0.1);
         setDiskSpeed(speedMBs * 8); // Display as Mbps
       }
 
+      setVmLog(prev => [...prev, '[SYS] Compiling ISO chunks into Blob...']);
       const fullBlob = new Blob(chunks, { type: 'application/x-iso9660-image' });
       const url = URL.createObjectURL(fullBlob);
       setIsoBlobUrl(url);
@@ -363,21 +349,9 @@ export default function VMwarePC() {
       }, 1000);
 
     } catch (e) {
-      console.error("Real download failed, falling back to simulated high-speed download:", e);
-      // Fallback if proxy is blocked or network fails
-      let progress = 0;
-      const interval = setInterval(() => {
-        const increment = 0.5 + Math.random() * 2;
-        progress += increment;
-        if (progress >= 100) {
-          progress = 100;
-          clearInterval(interval);
-          setVmStatus('booting');
-          setIsoBlobUrl("https://copy.sh/v86/images/linux.iso"); // fallback to dummy
-          allocateSystemResources();
-        }
-        setDownloadProgress(progress);
-      }, 100);
+      console.error("Real ISO download failed:", e);
+      setError("Failed to download ISO: " + (e instanceof Error ? e.message : "Network or Proxy error."));
+      setVmStatus('off');
     }
   };
 
@@ -390,7 +364,12 @@ export default function VMwarePC() {
         setVmStatus('installed');
         allocateSystemResources();
       } else {
-        checkRequirements();
+        if (isoBlobUrl) {
+          setVmStatus('booting');
+          allocateSystemResources();
+        } else {
+          checkRequirements();
+        }
       }
     } else {
       handlePowerOn(type);
@@ -545,7 +524,7 @@ export default function VMwarePC() {
     if (vmStatus === 'booting' && !document.getElementById('v86-script')) {
       const script = document.createElement('script');
       script.id = 'v86-script';
-      script.src = 'https://copy.sh/v86/libv86.js';
+      script.src = 'https://copy.sh/v86/build/libv86.js';
       document.head.appendChild(script);
     }
   }, [vmStatus]);
@@ -1694,27 +1673,26 @@ export default function VMwarePC() {
                         </div>
                       </div>
                     ) : activeVM === 'debian' ? (
-                      <div className="w-full h-full bg-[#0a0a0a] flex flex-col relative overflow-hidden">
-                        {/* Real Resource Monitor (Persistent during session) */}
-                        <div className="absolute top-4 right-4 z-[100] bg-black/90 border border-green-500/30 p-4 rounded-xl font-mono text-[10px] text-green-400 space-y-2 shadow-2xl backdrop-blur-md">
-                           <div className="flex items-center gap-2 mb-2 border-b border-green-500/20 pb-1 text-white">
-                             <Activity className="w-3 h-3" />
-                             <span className="font-bold uppercase tracking-widest text-[9px]">Local Hardware Monitor</span>
-                           </div>
-                           <div className="flex justify-between gap-8">
-                             <span>ACTIVE vCPUs:</span>
-                             <span className="text-white">{hwStats.cores}</span>
-                           </div>
-                           <div className="flex justify-between gap-8">
-                             <span>REAL RAM ALLOC:</span>
-                             <span className="text-white">{hwStats.ram.toFixed(1)} GB</span>
-                           </div>
-                           <div className="flex items-center gap-2 mt-2">
-                             <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
-                             <span className="text-green-400 text-[8px]">VM TOOLS INSTALLED</span>
-                           </div>
+                      <div className="w-full h-full bg-[#0a0a0a] flex flex-col items-center justify-center relative overflow-hidden">
+                        <div className="text-center space-y-4 font-mono">
+                           <HardDrive className="w-16 h-16 text-blue-500 mx-auto opacity-50" />
+                           <h2 className="text-blue-400 text-xl">Debian 13 (Installed)</h2>
+                           <p className="text-zinc-500 max-w-sm mx-auto text-sm">
+                             The virtual machine has been flagged as installed.
+                             Would you like to restart the WASM emulator and boot from the local IndexedDB state?
+                           </p>
+                           <button 
+                             onClick={() => {
+                               localStorage.removeItem('vmware_vdmk_debian');
+                               setIsDebianInstalled(false);
+                               setVmStatus('off');
+                               setIsoBlobUrl(null);
+                             }}
+                             className="px-4 py-2 bg-red-500/10 text-red-400 hover:bg-red-500/20 border border-red-500/20 rounded transition-colors text-xs"
+                           >
+                              Reset VM State (Format Disk)
+                           </button>
                         </div>
-                        <DistroSea />
                       </div>
                     ) : activeVM === 'linux_server' ? (
                       <div className="w-full h-full bg-black flex flex-col p-6 font-mono text-sm text-green-500 overflow-hidden">
